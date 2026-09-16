@@ -1,0 +1,19 @@
+[package]
+name = "tricore"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/techton7/tricore"
+authors = ["GoCoder <gocoder7@gmail.com>"]
+description = "Pure Rust, host-agnostic WGPU graphics runtime with first-class offscreen rendering, 2D batching, and 3D scene core."
+readme = "README.md"
+keywords = ["wgpu", "graphics", "renderer", "viewport", "offscreen"]
+categories = ["rendering::graphics-api", "graphics"]
+
+[dependencies]
+wgpu = "29"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.29"
+
+[dev-dependencies]
+pollster = "0.4"
