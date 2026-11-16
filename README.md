@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/icon.svg" alt="tricore logo" width="160" height="160" />
   <h1>tricore</h1>
-  <p><strong>Pure Rust, host-agnostic WGPU graphics runtime with first-class offscreen rendering, 2D batching, and 3D scene core.</strong></p>
+  <p><strong>Host-agnostic WGPU render core for <code>trioxus</code>, offscreen plugin hosts, and headless Rust pipelines.</strong></p>
 
   <p>
     <a href="https://crates.io/crates/tricore"><img src="https://img.shields.io/crates/v/tricore.svg" alt="Crates.io" /></a>
@@ -12,81 +12,90 @@
 
 ---
 
-## Overview
+> **Status:** early-stage crate. The current release establishes the shared crate boundary and foundational types. The renderer surface and API are expected to evolve as `trioxus` and other hosts adopt the core.
 
-`tricore` is the foundational, host-neutral graphics and viewport engine for the Rust ecosystem. It is intentionally designed without coupling to any specific UI framework or window manager, enabling identical GPU-accelerated rendering pipelines across:
+## What `tricore` is
 
-- **Dioxus Web & Native Desktop** (via the [`trioxus`](https://github.com/techton7/trioxus) component facade)
-- **Embedded C/C++ Host Plugins** (such as SketchUp C SDK overlays with offscreen color & depth readback)
-- **Headless Simulations & Automated Test Harnesses**
+`tricore` is the shared graphics core extracted so renderer code does not have to live permanently inside a single host integration crate.
 
----
+It is intended to support:
 
-## Core Capabilities
+- `trioxus`, as the Dioxus-facing canvas and embedding facade
+- offscreen/plugin hosts such as SketchUp-style overlay integrations
+- headless render, test, and tooling pipelines
 
-- **Surface-Agnostic & Offscreen-First:** First-class offscreen color (`Rgba8Unorm`) and depth (`Depth32Float`) render targets, with dedicated staging buffers for CPU readback (`ColorReadbackBuffer`, `DepthReadbackBuffer`).
-- **GPU Instanced 2D Batching:** High-volume parametric cubic Bézier curves, line strips, background grids, and LOD proxy quads designed for responsive flow graphs and CAD editors.
-- **Host-Neutral Viewport & Camera Math:** Unbiased projection, view matrices, and coordinate inversion (`viewport_to_world_2d`, `world_to_viewport_2d`, `viewport_to_ray`) with support for raw external host matrix injection.
-- **3D Scene Core:** Foundational mesh primitives, indexed vertex buffers, PBR materials, and transform hierarchies.
-- **Animatable Handles:** Direct numeric and transform controllers (`CameraHandle`, `FloatBufferHandle`) for zero-overhead motion interpolation via `kinetocore`.
+`tricore` intentionally does **not** own UI mounting, DOM integration, Blitz widget policy, or host/plugin lifecycle code.
 
----
+## What is available today
 
-## Architecture: Core-Facade Separation
+The current crate provides foundational building blocks:
 
-```text
-[ kinetocore ] (Pure motion/timeline math)
-         ▲         ▲
-         │         │
-[ kinetoxus ]   [ tricore ] (Host-agnostic WGPU render core)
-(Dioxus motion)    ▲         ▲
-         │       │         │
-         ▼       │         │ (Zero Dioxus dependency!)
-       [ trioxus ]         └──────► [ SketchUp / CAD Host Plugin ]
-  (Dioxus UI Canvas)                (C SDK + Overlay + Readback)
-```
+| Module | Current role |
+|---|---|
+| `renderer` | Shared `GpuContext` for adopted or headless `wgpu::Device` / `wgpu::Queue` ownership |
+| `targets` | Render target dimensions plus offscreen color/depth target allocation |
+| `readback` | CPU readback staging buffers for color and depth textures |
+| `camera` | 2D, 3D, and raw-matrix camera definitions |
+| `math` | Host-neutral viewport math such as `viewport_to_world_2d`, `world_to_viewport_2d`, and `viewport_to_ray` |
+| `handles` | Renderer-owned camera and numeric buffer handles |
+| `batch2d` | Data structures for lines, cubic beziers, grids, and proxy quads |
+| `scene3d` | Foundational mesh, material, and transform data structures |
 
----
+These are **foundations**, not a feature-complete scene engine yet.
 
-## Getting Started
+## Example
 
-Add `tricore` to your `Cargo.toml`:
-
-```toml
-[dependencies]
-tricore = "0.1"
-```
-
-### Headless Offscreen Example
+This example uses only APIs that exist in the current crate surface:
 
 ```rust
-use tricore::{Camera2D, GpuContext, OffscreenTarget, TargetDimensions};
-use wgpu::PowerPreference;
+use tricore::{
+    glam::vec2,
+    viewport_to_world_2d,
+    Camera2D,
+    Mesh3D,
+    ViewportRect,
+};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // 1. Initialize standalone headless GPU context
-    let gpu = GpuContext::new_headless(PowerPreference::HighPerformance).await?;
+fn main() {
+    let camera = Camera2D::default();
+    let viewport = ViewportRect::new(0.0, 0.0, 800.0, 600.0);
 
-    // 2. Create offscreen render target (1920x1080)
-    let dimensions = TargetDimensions::new(1920, 1080, 1.0);
-    let target = OffscreenTarget::new(
-        &gpu.device,
-        dimensions,
-        wgpu::TextureFormat::Rgba8Unorm,
-        Some(wgpu::TextureFormat::Depth32Float),
+    let world_pt = viewport_to_world_2d(
+        vec2(400.0, 300.0),
+        viewport,
+        camera.view_proj_matrix(800.0, 600.0).inverse(),
     );
 
-    // 3. Setup 2D camera
-    let camera = Camera2D::new(glam::Vec2::ZERO, 1.0);
-    let _view_proj = camera.view_proj_matrix(1920.0, 1080.0);
+    let cube = Mesh3D::unit_cube();
 
-    println!("Tricore offscreen target ready: {}x{}", target.dimensions.width, target.dimensions.height);
-    Ok(())
+    assert_eq!(cube.indices.len(), 36);
+    println!("Viewport center maps to {world_pt:?}");
 }
 ```
 
----
+## Design goals
+
+- Keep the core host-agnostic.
+- Treat offscreen rendering as a first-class path, not an afterthought.
+- Keep viewport-space math in the core and host-specific screen mapping in facade crates.
+- Provide reusable building blocks for both 2D batch-heavy and 3D scene workloads.
+- Stay compatible with higher-level facades such as `trioxus` without becoming a UI crate itself.
+
+## Not the goal of this crate
+
+At this stage, `tricore` is **not** trying to be:
+
+- a Dioxus UI library
+- a SketchUp plugin framework
+- a stable 1.0 renderer API
+- a Three.js compatibility layer
+- a claim of complete rendering feature coverage
+
+## Relationship to sibling crates
+
+- `tricore` owns host-agnostic graphics and math primitives.
+- `trioxus` should consume `tricore` to provide Dioxus-facing canvas and embedding APIs.
+- Motion ergonomics belong in higher-level motion crates, not in `tricore` itself.
 
 ## License
 
