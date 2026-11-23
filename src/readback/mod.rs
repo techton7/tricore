@@ -2,23 +2,31 @@
 
 use std::fmt;
 
-/// Output pixel channel ordering for [`ReadbackSurface`].
+/// Channel swizzle mode applied during [`ReadbackSurface`] row repacking.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ColorOrder {
+pub enum ChannelSwizzle {
+    /// Preserve source texture channel byte order (e.g., RGBA->RGBA or BGRA->BGRA).
     #[default]
-    Rgba,
-    Bgra,
+    None,
+    /// Swap red and blue channels (e.g., RGBA->BGRA or BGRA->RGBA).
+    SwapRB,
 }
 
 /// Configuration for [`ReadbackSurface`] row repacking and channel conversions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReadbackOptions {
-    pub color_order: ColorOrder,
+    pub swizzle: ChannelSwizzle,
     pub y_flip: bool,
     pub unpremultiply: bool,
 }
 
-/// Errors produced by [`ReadbackSurface`] map/poll operations.
+/// Configuration for [`DepthReadbackSurface`] row repacking.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DepthReadbackOptions {
+    pub y_flip: bool,
+}
+
+/// Errors produced by [`ReadbackSurface`] and [`DepthReadbackSurface`] map/poll operations.
 #[derive(Debug)]
 pub enum ReadbackError {
     NotInitialized,
@@ -52,7 +60,67 @@ impl std::error::Error for ReadbackError {
     }
 }
 
-/// Buffer for reading rendered RGBA color pixels from GPU memory into CPU host memory.
+fn copy_texture_to_staging_buffer(
+    encoder: &mut wgpu::CommandEncoder,
+    texture: &wgpu::Texture,
+    aspect: wgpu::TextureAspect,
+    buffer: &wgpu::Buffer,
+    width: u32,
+    height: u32,
+    row_pitch: u32,
+) {
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row_pitch),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
+fn map_buffer_sync(
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+    on_mapped: impl FnOnce(&[u8]),
+) -> Result<(), ReadbackError> {
+    let slice = buffer.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res);
+    });
+
+    #[cfg(not(target_arch = "wasm32"))]
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(ReadbackError::Poll)?;
+
+    rx.recv()
+        .map_err(ReadbackError::ChannelClosed)?
+        .map_err(ReadbackError::BufferAsync)?;
+
+    {
+        let mapped = slice.get_mapped_range().map_err(ReadbackError::MapRange)?;
+        on_mapped(&mapped);
+    }
+    buffer.unmap();
+    Ok(())
+}
+
+/// Buffer for reading rendered RGBA/BGRA color pixels from GPU memory into CPU host memory.
 pub struct ColorReadbackBuffer {
     pub buffer: wgpu::Buffer,
     pub width: u32,
@@ -85,39 +153,27 @@ impl ColorReadbackBuffer {
         }
     }
 
-    /// Enqueues a copy from the offscreen texture into this readback staging buffer.
+    /// Enqueues a copy from the offscreen color texture into this readback staging buffer.
     pub fn copy_from_texture(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         texture: &wgpu::Texture,
     ) {
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &self.buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(self.row_pitch),
-                    rows_per_image: Some(self.height),
-                },
-            },
-            wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
+        copy_texture_to_staging_buffer(
+            encoder,
+            texture,
+            wgpu::TextureAspect::All,
+            &self.buffer,
+            self.width,
+            self.height,
+            self.row_pitch,
         );
     }
 }
 
 /// Reusable GPU-to-CPU color readback surface owning a staging buffer and a persistent pixel cache.
 ///
-/// Handles 256-byte row-pitch unpadding, optional RGBA->BGRA swizzling, optional Y-axis flip,
+/// Handles 256-byte row-pitch unpadding, optional R/B channel swizzling, optional Y-axis flip,
 /// and optional unpremultiplication, while retaining [`Self::cached_pixels`] for zero-cost idle frames.
 pub struct ReadbackSurface {
     staging: Option<ColorReadbackBuffer>,
@@ -195,33 +251,15 @@ impl ReadbackSurface {
     /// Synchronously maps the staging buffer, unpacks rows into [`Self::cached_pixels`], and unmaps.
     pub fn map_and_repack(&mut self, device: &wgpu::Device) -> Result<&[u8], ReadbackError> {
         let staging = self.staging.as_ref().ok_or(ReadbackError::NotInitialized)?;
-        let slice = staging.buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
+        let width = self.width;
+        let height = self.height;
+        let row_pitch = staging.row_pitch;
+        let options = self.options;
+        let cached = &mut self.cached_pixels;
 
-        #[cfg(not(target_arch = "wasm32"))]
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(ReadbackError::Poll)?;
-
-        rx.recv()
-            .map_err(ReadbackError::ChannelClosed)?
-            .map_err(ReadbackError::BufferAsync)?;
-
-        {
-            let mapped = slice.get_mapped_range().map_err(ReadbackError::MapRange)?;
-            repack_rgba_rows(
-                &mapped,
-                &mut self.cached_pixels,
-                self.width,
-                self.height,
-                staging.row_pitch,
-                self.options,
-            );
-        }
-        staging.buffer.unmap();
+        map_buffer_sync(device, &staging.buffer, |mapped| {
+            repack_rgba_rows(mapped, cached, width, height, row_pitch, options);
+        })?;
         Ok(&self.cached_pixels)
     }
 
@@ -242,8 +280,8 @@ impl ReadbackSurface {
     }
 }
 
-/// Repacks 256-byte padded RGBA GPU rows into tightly packed CPU pixels with optional
-/// Y-flip, unpremultiplication, and RGBA->BGRA swizzling.
+/// Repacks 256-byte padded 4-channel GPU rows into tightly packed CPU pixels with optional
+/// Y-flip, unpremultiplication, and R/B channel swizzling.
 pub fn repack_rgba_rows(
     src_padded: &[u8],
     dst: &mut [u8],
@@ -264,37 +302,37 @@ pub fn repack_rgba_rows(
         let src_row = &src_padded[y * padded..y * padded + unpadded];
         let dst_row = &mut dst[dst_y * unpadded..dst_y * unpadded + unpadded];
 
-        if !options.unpremultiply && options.color_order == ColorOrder::Rgba {
+        if options.swizzle == ChannelSwizzle::None && !options.unpremultiply {
             dst_row.copy_from_slice(src_row);
             continue;
         }
 
         for (src_px, dst_px) in src_row.chunks_exact(4).zip(dst_row.chunks_exact_mut(4)) {
-            let (mut r, mut g, mut b, a) = (src_px[0], src_px[1], src_px[2], src_px[3]);
+            let (mut c0, mut c1, mut c2, a) = (src_px[0], src_px[1], src_px[2], src_px[3]);
             if options.unpremultiply {
                 if a == 0 {
-                    r = 0;
-                    g = 0;
-                    b = 0;
+                    c0 = 0;
+                    c1 = 0;
+                    c2 = 0;
                 } else if a < 255 {
                     let a32 = a as u32;
-                    r = ((r as u32 * 255 + a32 / 2) / a32).min(255) as u8;
-                    g = ((g as u32 * 255 + a32 / 2) / a32).min(255) as u8;
-                    b = ((b as u32 * 255 + a32 / 2) / a32).min(255) as u8;
+                    c0 = ((c0 as u32 * 255 + a32 / 2) / a32).min(255) as u8;
+                    c1 = ((c1 as u32 * 255 + a32 / 2) / a32).min(255) as u8;
+                    c2 = ((c2 as u32 * 255 + a32 / 2) / a32).min(255) as u8;
                 }
             }
 
-            match options.color_order {
-                ColorOrder::Rgba => {
-                    dst_px[0] = r;
-                    dst_px[1] = g;
-                    dst_px[2] = b;
+            match options.swizzle {
+                ChannelSwizzle::None => {
+                    dst_px[0] = c0;
+                    dst_px[1] = c1;
+                    dst_px[2] = c2;
                     dst_px[3] = a;
                 }
-                ColorOrder::Bgra => {
-                    dst_px[0] = b;
-                    dst_px[1] = g;
-                    dst_px[2] = r;
+                ChannelSwizzle::SwapRB => {
+                    dst_px[0] = c2;
+                    dst_px[1] = c1;
+                    dst_px[2] = c0;
                     dst_px[3] = a;
                 }
             }
@@ -302,7 +340,7 @@ pub fn repack_rgba_rows(
     }
 }
 
-/// Buffer for reading rendered depth values (Depth32Float) from GPU memory into CPU host memory.
+/// Buffer for reading rendered depth values (`Depth32Float`) from GPU memory into CPU host memory.
 pub struct DepthReadbackBuffer {
     pub buffer: wgpu::Buffer,
     pub width: u32,
@@ -333,6 +371,149 @@ impl DepthReadbackBuffer {
             unpadded_row_bytes,
         }
     }
+
+    /// Enqueues a `DepthOnly` copy from the `Depth32Float` texture into this staging buffer.
+    pub fn copy_from_texture(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+    ) {
+        copy_texture_to_staging_buffer(
+            encoder,
+            texture,
+            wgpu::TextureAspect::DepthOnly,
+            &self.buffer,
+            self.width,
+            self.height,
+            self.row_pitch,
+        );
+    }
+}
+
+/// Reusable GPU-to-CPU `Depth32Float` readback surface owning a staging buffer and persistent `[0.0, 1.0]` cache.
+pub struct DepthReadbackSurface {
+    staging: Option<DepthReadbackBuffer>,
+    cached_depths: Vec<f32>,
+    width: u32,
+    height: u32,
+    options: DepthReadbackOptions,
+}
+
+impl DepthReadbackSurface {
+    pub fn new(options: DepthReadbackOptions) -> Self {
+        Self {
+            staging: None,
+            cached_depths: Vec::new(),
+            width: 0,
+            height: 0,
+            options,
+        }
+    }
+
+    pub fn options(&self) -> DepthReadbackOptions {
+        self.options
+    }
+
+    pub fn set_options(&mut self, options: DepthReadbackOptions) {
+        self.options = options;
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn cached_depths(&self) -> &[f32] {
+        &self.cached_depths
+    }
+
+    pub fn cached_bytes(&self) -> &[u8] {
+        bytemuck::cast_slice(&self.cached_depths)
+    }
+
+    /// Ensures the depth staging buffer and CPU cache match `(width, height)`, clamping to at least 1x1.
+    /// Returns `true` if the staging buffer was allocated or reallocated.
+    pub fn ensure_dimensions(&mut self, device: &wgpu::Device, width: u32, height: u32) -> bool {
+        let w = width.max(1);
+        let h = height.max(1);
+        if self.staging.is_some() && self.width == w && self.height == h {
+            return false;
+        }
+        self.staging = Some(DepthReadbackBuffer::new(device, w, h));
+        self.cached_depths.resize((w * h) as usize, 1.0);
+        self.width = w;
+        self.height = h;
+        true
+    }
+
+    /// Encodes a `DepthOnly` texture-to-staging-buffer copy into `encoder`.
+    pub fn copy_from_texture(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        depth_texture: &wgpu::Texture,
+    ) -> Result<(), ReadbackError> {
+        let staging = self.staging.as_ref().ok_or(ReadbackError::NotInitialized)?;
+        staging.copy_from_texture(encoder, depth_texture);
+        Ok(())
+    }
+
+    /// Synchronously maps the staging buffer, unpacks depth rows into [`Self::cached_depths`], and unmaps.
+    pub fn map_and_repack(&mut self, device: &wgpu::Device) -> Result<&[f32], ReadbackError> {
+        let staging = self.staging.as_ref().ok_or(ReadbackError::NotInitialized)?;
+        let width = self.width;
+        let height = self.height;
+        let row_pitch = staging.row_pitch;
+        let options = self.options;
+        let cached = &mut self.cached_depths;
+
+        map_buffer_sync(device, &staging.buffer, |mapped| {
+            repack_depth_rows(mapped, cached, width, height, row_pitch, options);
+        })?;
+        Ok(&self.cached_depths)
+    }
+
+    /// Ensures dimensions match `depth_texture`, submits a copy command, and reads back depths synchronously.
+    pub fn readback_sync(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        depth_texture: &wgpu::Texture,
+    ) -> Result<&[f32], ReadbackError> {
+        self.ensure_dimensions(device, depth_texture.width(), depth_texture.height());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tricore_depth_readback_encoder"),
+        });
+        self.copy_from_texture(&mut encoder, depth_texture)?;
+        queue.submit(std::iter::once(encoder.finish()));
+        self.map_and_repack(device)
+    }
+}
+
+/// Repacks 256-byte padded `Depth32Float` GPU rows into tightly packed `f32` slices with optional Y-flip.
+pub fn repack_depth_rows(
+    src_padded: &[u8],
+    dst: &mut [f32],
+    width: u32,
+    height: u32,
+    padded_row_pitch: u32,
+    options: DepthReadbackOptions,
+) {
+    let w = width as usize;
+    let h = height as usize;
+    let unpadded_bytes = w * std::mem::size_of::<f32>();
+    let padded = padded_row_pitch as usize;
+    debug_assert!(src_padded.len() >= h.saturating_sub(1) * padded + unpadded_bytes);
+    debug_assert!(dst.len() >= h * w);
+
+    for y in 0..h {
+        let dst_y = if options.y_flip { h - 1 - y } else { y };
+        let src_bytes = &src_padded[y * padded..y * padded + unpadded_bytes];
+        let dst_row = &mut dst[dst_y * w..dst_y * w + w];
+        bytemuck::cast_slice_mut(dst_row).copy_from_slice(src_bytes);
+    }
 }
 
 #[cfg(test)]
@@ -349,11 +530,11 @@ mod tests {
         // Row 0: pixel(0,0) = [64, 32, 0, 128] (premul), pixel(1,0) = [10, 20, 30, 255]
         padded[0..4].copy_from_slice(&[64, 32, 0, 128]);
         padded[4..8].copy_from_slice(&[10, 20, 30, 255]);
-        // Row 1: pixel(0,1) = [0, 0, 0, 0], pixel(1,1) = [255, 128, 64, 255]
+        // Row 1: pixel(0,1) = [99, 88, 77, 0], pixel(1,1) = [255, 128, 64, 255]
         padded[pitch..pitch + 4].copy_from_slice(&[99, 88, 77, 0]);
         padded[pitch + 4..pitch + 8].copy_from_slice(&[255, 128, 64, 255]);
 
-        let mut dst = vec![0u8; (width * height * 4) as usize];
+        let mut dst = vec![0u8; width * height * 4];
         repack_rgba_rows(
             &padded,
             &mut dst,
@@ -361,7 +542,7 @@ mod tests {
             height as u32,
             pitch as u32,
             ReadbackOptions {
-                color_order: ColorOrder::Bgra,
+                swizzle: ChannelSwizzle::SwapRB,
                 y_flip: true,
                 unpremultiply: true,
             },
@@ -370,11 +551,65 @@ mod tests {
         // Flipped: Row 1 becomes row 0, Row 0 becomes row 1.
         // Old (0,1) had alpha=0 -> zeroed RGB
         assert_eq!(&dst[0..4], &[0, 0, 0, 0]);
-        // Old (1,1) -> BGRA [64, 128, 255, 255]
+        // Old (1,1) -> swapped [64, 128, 255, 255]
         assert_eq!(&dst[4..8], &[64, 128, 255, 255]);
-        // Old (0,0) unpremultiplied: r = (64*255+64)/128 = 128, g = (32*255+64)/128 = 64, b = 0 -> BGRA [0, 64, 128, 128]
+        // Old (0,0) unpremultiplied: r = (64*255+64)/128 = 128, g = (32*255+64)/128 = 64, b = 0 -> swapped [0, 64, 128, 128]
         assert_eq!(&dst[8..12], &[0, 64, 128, 128]);
-        // Old (1,0) -> BGRA [30, 20, 10, 255]
+        // Old (1,0) -> swapped [30, 20, 10, 255]
         assert_eq!(&dst[12..16], &[30, 20, 10, 255]);
+
+        // Fast-path ChannelSwizzle::None without unpremultiply preserves exact byte order.
+        let mut fast_dst = vec![0u8; width * height * 4];
+        repack_rgba_rows(
+            &padded,
+            &mut fast_dst,
+            width as u32,
+            height as u32,
+            pitch as u32,
+            ReadbackOptions {
+                swizzle: ChannelSwizzle::None,
+                y_flip: false,
+                unpremultiply: false,
+            },
+        );
+        assert_eq!(&fast_dst[0..4], &[64, 32, 0, 128]);
+        assert_eq!(&fast_dst[4..8], &[10, 20, 30, 255]);
+        assert_eq!(&fast_dst[8..12], &[99, 88, 77, 0]);
+        assert_eq!(&fast_dst[12..16], &[255, 128, 64, 255]);
+    }
+
+    #[test]
+    fn repack_depth_rows_unpads_and_flips() {
+        let width = 3;
+        let height = 2;
+        let pitch = 256;
+        let mut padded = vec![0u8; pitch * height];
+
+        let row0 = [0.1_f32, 0.25_f32, 0.5_f32];
+        let row1 = [0.75_f32, 0.9_f32, 1.0_f32];
+        padded[0..12].copy_from_slice(bytemuck::cast_slice(&row0));
+        padded[pitch..pitch + 12].copy_from_slice(bytemuck::cast_slice(&row1));
+
+        let mut dst_no_flip = vec![0.0_f32; width * height];
+        repack_depth_rows(
+            &padded,
+            &mut dst_no_flip,
+            width as u32,
+            height as u32,
+            pitch as u32,
+            DepthReadbackOptions { y_flip: false },
+        );
+        assert_eq!(dst_no_flip, vec![0.1, 0.25, 0.5, 0.75, 0.9, 1.0]);
+
+        let mut dst_flip = vec![0.0_f32; width * height];
+        repack_depth_rows(
+            &padded,
+            &mut dst_flip,
+            width as u32,
+            height as u32,
+            pitch as u32,
+            DepthReadbackOptions { y_flip: true },
+        );
+        assert_eq!(dst_flip, vec![0.75, 0.9, 1.0, 0.1, 0.25, 0.5]);
     }
 }

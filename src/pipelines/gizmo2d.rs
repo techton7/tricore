@@ -81,6 +81,7 @@ struct GizmoViewportUniform {
 pub struct ScreenTrianglePipeline {
     color_only_pipeline: wgpu::RenderPipeline,
     depth_pipeline: Option<wgpu::RenderPipeline>,
+    depth_stamp_pipeline: Option<wgpu::RenderPipeline>,
     encode_srgb: u32,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -96,6 +97,7 @@ fn create_gizmo_pipeline(
     shader: &wgpu::ShaderModule,
     color_format: wgpu::TextureFormat,
     depth_format: Option<wgpu::TextureFormat>,
+    depth_write: bool,
 ) -> wgpu::RenderPipeline {
     let pos_layout = wgpu::VertexBufferLayout {
         array_stride: 8,
@@ -116,12 +118,14 @@ fn create_gizmo_pipeline(
         }],
     };
 
+    let label = match (depth_format.is_some(), depth_write) {
+        (false, _) => "tricore_gizmo2d_color_pipeline",
+        (true, false) => "tricore_gizmo2d_depth_pipeline",
+        (true, true) => "tricore_gizmo2d_depth_stamp_pipeline",
+    };
+
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(if depth_format.is_some() {
-            "tricore_gizmo2d_depth_pipeline"
-        } else {
-            "tricore_gizmo2d_color_pipeline"
-        }),
+        label: Some(label),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
@@ -140,7 +144,7 @@ fn create_gizmo_pipeline(
         },
         depth_stencil: depth_format.map(|format| wgpu::DepthStencilState {
             format,
-            depth_write_enabled: Some(false),
+            depth_write_enabled: Some(depth_write),
             depth_compare: Some(wgpu::CompareFunction::Always),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
@@ -209,13 +213,18 @@ impl ScreenTrianglePipeline {
         });
 
         let color_only_pipeline =
-            create_gizmo_pipeline(device, &pipeline_layout, &shader, color_format, None);
-        let depth_pipeline = depth_format
-            .map(|df| create_gizmo_pipeline(device, &pipeline_layout, &shader, color_format, Some(df)));
+            create_gizmo_pipeline(device, &pipeline_layout, &shader, color_format, None, false);
+        let depth_pipeline = depth_format.map(|df| {
+            create_gizmo_pipeline(device, &pipeline_layout, &shader, color_format, Some(df), false)
+        });
+        let depth_stamp_pipeline = depth_format.map(|df| {
+            create_gizmo_pipeline(device, &pipeline_layout, &shader, color_format, Some(df), true)
+        });
 
         Self {
             color_only_pipeline,
             depth_pipeline,
+            depth_stamp_pipeline,
             encode_srgb: u32::from(!color_format.is_srgb()),
             uniform_buffer,
             bind_group,
@@ -274,15 +283,33 @@ impl ScreenTrianglePipeline {
 
     /// Records the prepared screen-triangle draw into an active render pass.
     pub fn draw_prepared<'rp>(&'rp self, pass: &mut wgpu::RenderPass<'rp>, with_depth: bool) {
+        self.draw_prepared_inner(pass, with_depth, false);
+    }
+
+    /// Records the prepared screen-triangle draw into an active render pass, stamping `z = 0.0` into depth.
+    pub fn draw_prepared_with_depth_stamp<'rp>(&'rp self, pass: &mut wgpu::RenderPass<'rp>) {
+        self.draw_prepared_inner(pass, true, true);
+    }
+
+    fn draw_prepared_inner<'rp>(
+        &'rp self,
+        pass: &mut wgpu::RenderPass<'rp>,
+        with_depth: bool,
+        stamp_depth: bool,
+    ) {
         if self.prepared_index_count == 0 {
             return;
         }
-        let pipeline = if with_depth {
-            self.depth_pipeline
+        let pipeline = match (with_depth, stamp_depth) {
+            (false, _) => &self.color_only_pipeline,
+            (true, false) => self
+                .depth_pipeline
                 .as_ref()
-                .expect("ScreenTrianglePipeline created without depth_format")
-        } else {
-            &self.color_only_pipeline
+                .expect("ScreenTrianglePipeline created without depth_format"),
+            (true, true) => self
+                .depth_stamp_pipeline
+                .as_ref()
+                .expect("ScreenTrianglePipeline created without depth_format"),
         };
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
@@ -292,9 +319,7 @@ impl ScreenTrianglePipeline {
         pass.draw_indexed(0..self.prepared_index_count, 0, 0..1);
     }
 
-    /// Prepares the batch and composites it onto `color_view` using `LoadOp::Load`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn render(
+    fn render_internal(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -303,12 +328,18 @@ impl ScreenTrianglePipeline {
         depth_view: Option<&wgpu::TextureView>,
         viewport: ViewportRect,
         batch: &ScreenTriangleBatch<'_>,
+        stamp_depth: bool,
     ) {
         if !self.prepare(device, queue, viewport, batch) {
             return;
         }
 
-        let attach_depth = depth_view.filter(|_| self.depth_pipeline.is_some());
+        let has_depth_pipeline = if stamp_depth {
+            self.depth_stamp_pipeline.is_some()
+        } else {
+            self.depth_pipeline.is_some()
+        };
+        let attach_depth = depth_view.filter(|_| has_depth_pipeline);
         let depth_attachment = attach_depth.map(|view| wgpu::RenderPassDepthStencilAttachment {
             view,
             depth_ops: Some(wgpu::Operations {
@@ -335,6 +366,40 @@ impl ScreenTrianglePipeline {
             multiview_mask: None,
         });
 
-        self.draw_prepared(&mut pass, attach_depth.is_some());
+        self.draw_prepared_inner(&mut pass, attach_depth.is_some(), stamp_depth);
+    }
+
+    /// Prepares the batch and composites it onto `color_view` using `LoadOp::Load`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        color_view: &wgpu::TextureView,
+        depth_view: Option<&wgpu::TextureView>,
+        viewport: ViewportRect,
+        batch: &ScreenTriangleBatch<'_>,
+    ) {
+        self.render_internal(
+            device, queue, encoder, color_view, depth_view, viewport, batch, false,
+        );
+    }
+
+    /// Prepares the batch, composites it onto `color_view` (`LoadOp::Load`), and stamps `z = 0.0` into `depth_view`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_depth_stamp(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        color_view: &wgpu::TextureView,
+        depth_view: Option<&wgpu::TextureView>,
+        viewport: ViewportRect,
+        batch: &ScreenTriangleBatch<'_>,
+    ) {
+        self.render_internal(
+            device, queue, encoder, color_view, depth_view, viewport, batch, true,
+        );
     }
 }
