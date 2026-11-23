@@ -9,11 +9,19 @@ description = "Pure Rust, host-agnostic WGPU graphics runtime with first-class o
 readme = "README.md"
 keywords = ["wgpu", "graphics", "renderer", "viewport", "offscreen"]
 categories = ["rendering::graphics-api", "graphics"]
+autotests = false
 
 [dependencies]
-wgpu = "29"
+wgpu = "30"
 bytemuck = { version = "1", features = ["derive"] }
 glam = "0.29"
 
 [dev-dependencies]
 pollster = "0.4"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[profile.dev.package."*"]
+opt-level = 3

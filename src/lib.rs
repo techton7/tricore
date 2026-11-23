@@ -12,19 +12,22 @@ pub mod batch2d;
 pub mod camera;
 pub mod handles;
 pub mod math;
+pub mod pipelines;
 pub mod readback;
 pub mod renderer;
 pub mod scene3d;
 pub mod targets;
 
-// Re-export glam for convenient math access across ecosystem
+// Re-export glam and wgpu for convenient math and GPU type identity across ecosystem
 pub use glam;
+pub use wgpu;
 
 // Flat re-exports for high-frequency ergonomics
 pub use batch2d::*;
 pub use camera::*;
 pub use handles::*;
 pub use math::*;
+pub use pipelines::*;
 pub use readback::*;
 pub use renderer::*;
 pub use scene3d::*;
