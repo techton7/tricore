@@ -18,5 +18,6 @@ pub fn shared_gpu() -> &'static GpuContext {
     try_shared_gpu().expect("headless WGPU adapter required for tricore integration tests")
 }
 
+mod depth_peeling;
 mod pipelines;
 mod targets_readback;

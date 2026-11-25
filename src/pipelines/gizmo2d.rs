@@ -43,12 +43,12 @@ fn linear_to_srgb_ch(c: f32) -> f32 {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    if (vp.encode_srgb == 0u) {
-        return in.color;
-    }
     let a = clamp(in.color.a, 0.0, 1.0);
     if (a <= 1e-6) {
-        return vec4<f32>(0.0);
+        discard;
+    }
+    if (vp.encode_srgb == 0u) {
+        return in.color;
     }
     let straight = in.color.rgb / a;
     let srgb = vec3<f32>(
@@ -400,6 +400,126 @@ impl ScreenTrianglePipeline {
     ) {
         self.render_internal(
             device, queue, encoder, color_view, depth_view, viewport, batch, true,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::readback::{DepthReadbackOptions, DepthReadbackSurface};
+    use crate::renderer::{GpuContext, GpuInitError};
+    use crate::targets::{OffscreenTarget, TargetDimensions};
+
+    #[test]
+    fn gizmo2d_depth_stamp_discards_zero_alpha_fragments() {
+        let gpu = match pollster::block_on(GpuContext::new_headless_for_platform(
+            wgpu::PowerPreference::HighPerformance,
+        )) {
+            Ok(g) => g,
+            Err(GpuInitError::NoAdapter(_)) => return,
+            Err(e) => panic!("GPU init failed: {e}"),
+        };
+
+        let w = 32_u32;
+        let h = 32_u32;
+        let target = OffscreenTarget::new(
+            &gpu.device,
+            TargetDimensions::new(w, h, 1.0),
+            wgpu::TextureFormat::Rgba8Unorm,
+            Some(wgpu::TextureFormat::Depth32Float),
+        );
+        let mut gizmo = ScreenTrianglePipeline::new(
+            &gpu.device,
+            wgpu::TextureFormat::Rgba8Unorm,
+            Some(wgpu::TextureFormat::Depth32Float),
+        );
+        let mut depth_rb = DepthReadbackSurface::new(DepthReadbackOptions { y_flip: false });
+        depth_rb.ensure_dimensions(&gpu.device, w, h);
+
+        // Two quads: left half alpha=0.0 (must discard and keep depth=0.6), right half alpha=1.0 (must stamp 0.0).
+        let vertices = [
+            [0.0, 0.0],
+            [16.0, 0.0],
+            [16.0, 32.0],
+            [0.0, 32.0],
+            [16.0, 0.0],
+            [32.0, 0.0],
+            [32.0, 32.0],
+            [16.0, 32.0],
+        ];
+        let colors = [
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+        ];
+        let indices = [0_u32, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7];
+
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gizmo2d_zero_alpha_discard_test"),
+            });
+        // Clear depth to 0.6 first.
+        {
+            let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("clear_depth_06"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: target.depth_view.as_ref().unwrap(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.6),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+
+        gizmo.render_with_depth_stamp(
+            &gpu.device,
+            &gpu.queue,
+            &mut encoder,
+            &target.color_view,
+            target.depth_view.as_ref(),
+            ViewportRect::new(0.0, 0.0, w as f32, h as f32),
+            &ScreenTriangleBatch {
+                vertices: &vertices,
+                colors: &colors,
+                indices: &indices,
+            },
+        );
+        depth_rb
+            .copy_from_texture(&mut encoder, target.depth_texture.as_ref().unwrap())
+            .unwrap();
+        gpu.queue.submit(std::iter::once(encoder.finish()));
+
+        let depths = depth_rb.map_and_repack(&gpu.device).unwrap();
+        let transparent_z = depths[(16 * w + 8) as usize];
+        assert!(
+            (transparent_z - 0.6).abs() < 1e-4,
+            "zero-alpha gizmo fragment must discard and keep depth=0.6, got {transparent_z}"
+        );
+        let opaque_z = depths[(16 * w + 24) as usize];
+        assert_eq!(
+            opaque_z, 0.0,
+            "opaque gizmo fragment must stamp depth=0.0, got {opaque_z}"
         );
     }
 }
