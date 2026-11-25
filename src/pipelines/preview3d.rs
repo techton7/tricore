@@ -1,14 +1,14 @@
 //! Depth-tested 3D tool preview pipeline (points, lines, line strips, opaque & translucent triangles)
-//! with D-P64-10 multi-pass front-to-back depth peeling (`K = 4`), `Rgba16Float` 2-MRT tail,
-//! and static 64x64 Void-and-Cluster blue-noise importance-sampled single-depth resolve.
+//! with P6.5 Pass A0 scene opaque depth pre-pass, integer-ULP-guarded front-to-back depth peeling
+//! (`K = 4`), `Rgba16Float` 2-MRT tail, and deterministic smooth Porter-Duff Over resolve.
 
 use glam::{Mat4, Vec4};
 
 use crate::camera::RawCamera;
-use crate::pipelines::blue_noise::{BLUE_NOISE_64X64, BLUE_NOISE_DIM};
 use crate::pipelines::DynamicGpuBuffer;
 
 const PEEL_LAYER_COUNT: usize = 4;
+const MAX_OCCLUDER_CLIP_PLANES: usize = 256;
 
 const PREVIEW3D_WGSL: &str = r#"
 struct CameraUniform {
@@ -75,6 +75,13 @@ fn fs_depth_stamp(in: VsOut) -> @location(0) vec4<f32> {
     return in.color;
 }
 
+fn peel_z_threshold(z_prev: f32) -> f32 {
+    if (z_prev >= 1.0) {
+        return 2.0;
+    }
+    return bitcast<f32>(bitcast<u32>(max(z_prev, 0.0)) + 2u);
+}
+
 @fragment
 fn fs_peel(in: VsOut) -> @location(0) vec4<f32> {
     if (in.color.a <= 1e-5) {
@@ -87,7 +94,7 @@ fn fs_peel(in: VsOut) -> @location(0) vec4<f32> {
     }
     if (peel_params.pass_idx > 0u) {
         let z_prev = textureLoad(prev_depth_tex, px, 0);
-        if (in.clip_pos.z <= z_prev) {
+        if (in.clip_pos.z <= peel_z_threshold(z_prev)) {
             discard;
         }
     }
@@ -108,13 +115,81 @@ fn fs_tail(in: VsOut) -> TailOut {
     let px = vec2<i32>(in.clip_pos.xy);
     let z_opaque = textureLoad(opaque_depth_tex, px, 0);
     let z_peel3 = textureLoad(prev_depth_tex, px, 0);
-    if (in.clip_pos.z > z_opaque || in.clip_pos.z <= z_peel3) {
+    if (in.clip_pos.z > z_opaque || in.clip_pos.z <= peel_z_threshold(z_peel3)) {
         discard;
     }
     var out: TailOut;
     out.accum = vec4<f32>(in.color.rgb * a, a);
     out.tail_meta = vec4<f32>(a, a, a, 1.0 - in.clip_pos.z);
     return out;
+}
+"#;
+
+const OCCLUDER_WGSL: &str = r#"
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
+};
+
+struct ClipPlanesUniform {
+    planes: array<vec4<f32>, 256>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera: CameraUniform;
+
+@group(0) @binding(1)
+var<uniform> clip_planes: ClipPlanesUniform;
+
+struct OccluderVsIn {
+    @location(0) pos: vec3<f32>,
+    @location(1) model_col0: vec4<f32>,
+    @location(2) model_col1: vec4<f32>,
+    @location(3) model_col2: vec4<f32>,
+    @location(4) model_col3: vec4<f32>,
+    @location(5) clip_range: vec2<u32>,
+};
+
+struct OccluderFastVsOut {
+    @invariant @builtin(position) clip_pos: vec4<f32>,
+};
+
+struct OccluderClippedVsOut {
+    @invariant @builtin(position) clip_pos: vec4<f32>,
+    @location(0) world_pos: vec3<f32>,
+    @location(1) @interpolate(flat) clip_range: vec2<u32>,
+};
+
+@vertex
+fn vs_occluder_fast(in: OccluderVsIn) -> OccluderFastVsOut {
+    let model = mat4x4<f32>(in.model_col0, in.model_col1, in.model_col2, in.model_col3);
+    let world = model * vec4<f32>(in.pos, 1.0);
+    var out: OccluderFastVsOut;
+    out.clip_pos = camera.view_proj * world;
+    return out;
+}
+
+@vertex
+fn vs_occluder_clipped(in: OccluderVsIn) -> OccluderClippedVsOut {
+    let model = mat4x4<f32>(in.model_col0, in.model_col1, in.model_col2, in.model_col3);
+    let world = model * vec4<f32>(in.pos, 1.0);
+    var out: OccluderClippedVsOut;
+    out.clip_pos = camera.view_proj * world;
+    out.world_pos = world.xyz;
+    out.clip_range = in.clip_range;
+    return out;
+}
+
+@fragment
+fn fs_occluder(in: OccluderClippedVsOut) {
+    let start = min(in.clip_range.x, 256u);
+    let count = min(in.clip_range.y, 256u - start);
+    let end = start + count;
+    for (var i: u32 = start; i < end; i = i + 1u) {
+        let p = clip_planes.planes[i];
+        if (dot(in.world_pos, p.xyz) + p.w < 0.0) {
+            discard;
+        }
+    }
 }
 "#;
 
@@ -143,7 +218,6 @@ fn vs_resolve(@builtin(vertex_index) vi: u32) -> ResolveVsOut {
 @group(0) @binding(9) var peel_depth_3: texture_depth_2d;
 @group(0) @binding(10) var tail_accum_tex: texture_2d<f32>;
 @group(0) @binding(11) var tail_meta_tex: texture_2d<f32>;
-@group(0) @binding(12) var blue_noise_tex: texture_2d<u32>;
 
 struct ResolveFsOut {
     @location(0) color: vec4<f32>,
@@ -154,23 +228,20 @@ struct ResolveFsOut {
 fn fs_resolve(in: ResolveVsOut) -> ResolveFsOut {
     let px = vec2<i32>(in.pos.xy);
 
-    var layers_rgb: array<vec3<f32>, 6>;
-    var layers_w: array<f32, 6>;
-    var layers_z: array<f32, 6>;
-    var count: u32 = 0u;
+    var accum_rgb: vec3<f32> = vec3<f32>(0.0);
     var transmittance: f32 = 1.0;
-    var total_alpha: f32 = 0.0;
+    var first_z: f32 = 1.0;
+    var has_layer: bool = false;
 
     let z0 = textureLoad(peel_depth_0, px, 0);
     if (z0 < 1.0) {
         let c0 = textureLoad(peel_color_0, px, 0);
         if (c0.a > 1e-5) {
-            let w = transmittance * c0.a;
-            layers_rgb[count] = c0.rgb;
-            layers_w[count] = w;
-            layers_z[count] = z0;
-            count = count + 1u;
-            total_alpha = total_alpha + w;
+            if (!has_layer) {
+                first_z = z0;
+                has_layer = true;
+            }
+            accum_rgb = accum_rgb + transmittance * c0.rgb * c0.a;
             transmittance = transmittance * (1.0 - c0.a);
         }
     }
@@ -179,12 +250,11 @@ fn fs_resolve(in: ResolveVsOut) -> ResolveFsOut {
     if (z1 < 1.0) {
         let c1 = textureLoad(peel_color_1, px, 0);
         if (c1.a > 1e-5) {
-            let w = transmittance * c1.a;
-            layers_rgb[count] = c1.rgb;
-            layers_w[count] = w;
-            layers_z[count] = z1;
-            count = count + 1u;
-            total_alpha = total_alpha + w;
+            if (!has_layer) {
+                first_z = z1;
+                has_layer = true;
+            }
+            accum_rgb = accum_rgb + transmittance * c1.rgb * c1.a;
             transmittance = transmittance * (1.0 - c1.a);
         }
     }
@@ -193,12 +263,11 @@ fn fs_resolve(in: ResolveVsOut) -> ResolveFsOut {
     if (z2 < 1.0) {
         let c2 = textureLoad(peel_color_2, px, 0);
         if (c2.a > 1e-5) {
-            let w = transmittance * c2.a;
-            layers_rgb[count] = c2.rgb;
-            layers_w[count] = w;
-            layers_z[count] = z2;
-            count = count + 1u;
-            total_alpha = total_alpha + w;
+            if (!has_layer) {
+                first_z = z2;
+                has_layer = true;
+            }
+            accum_rgb = accum_rgb + transmittance * c2.rgb * c2.a;
             transmittance = transmittance * (1.0 - c2.a);
         }
     }
@@ -207,12 +276,11 @@ fn fs_resolve(in: ResolveVsOut) -> ResolveFsOut {
     if (z3 < 1.0) {
         let c3 = textureLoad(peel_color_3, px, 0);
         if (c3.a > 1e-5) {
-            let w = transmittance * c3.a;
-            layers_rgb[count] = c3.rgb;
-            layers_w[count] = w;
-            layers_z[count] = z3;
-            count = count + 1u;
-            total_alpha = total_alpha + w;
+            if (!has_layer) {
+                first_z = z3;
+                has_layer = true;
+            }
+            accum_rgb = accum_rgb + transmittance * c3.rgb * c3.a;
             transmittance = transmittance * (1.0 - c3.a);
         }
     }
@@ -224,12 +292,11 @@ fn fs_resolve(in: ResolveVsOut) -> ResolveFsOut {
         if (a_tail > 1e-5) {
             let c_tail = clamp(tail_accum.rgb / tail_accum.a, vec3<f32>(0.0), vec3<f32>(1.0));
             let z_tail = clamp(1.0 - tail_meta.a, 0.0, 0.9999999);
-            let w = transmittance * a_tail;
-            layers_rgb[count] = c_tail;
-            layers_w[count] = w;
-            layers_z[count] = z_tail;
-            count = count + 1u;
-            total_alpha = total_alpha + w;
+            if (!has_layer) {
+                first_z = z_tail;
+                has_layer = true;
+            }
+            accum_rgb = accum_rgb + transmittance * c_tail * a_tail;
             transmittance = transmittance * (1.0 - a_tail);
         }
     }
@@ -239,47 +306,25 @@ fn fs_resolve(in: ResolveVsOut) -> ResolveFsOut {
         let op = textureLoad(opaque_color_tex, px, 0);
         if (op.a > 1e-5) {
             let c_op = clamp(op.rgb / op.a, vec3<f32>(0.0), vec3<f32>(1.0));
-            let w = transmittance * op.a;
-            layers_rgb[count] = c_op;
-            layers_w[count] = w;
-            layers_z[count] = z_op;
-            count = count + 1u;
-            total_alpha = total_alpha + w;
+            if (!has_layer) {
+                first_z = z_op;
+                has_layer = true;
+            }
+            accum_rgb = accum_rgb + transmittance * c_op * op.a;
             transmittance = transmittance * (1.0 - op.a);
         }
     }
 
     var out: ResolveFsOut;
-    if (count == 0u || total_alpha <= 1e-5) {
+    let total_alpha = clamp(1.0 - transmittance, 0.0, 1.0);
+    if (!has_layer || total_alpha <= 1e-5) {
         out.color = vec4<f32>(0.0);
         out.depth = 1.0;
         return out;
     }
 
-    let final_alpha = clamp(total_alpha, 0.0, 1.0);
-    if (count == 1u) {
-        out.color = vec4<f32>(layers_rgb[0] * final_alpha, final_alpha);
-        out.depth = layers_z[0];
-        return out;
-    }
-
-    let bn_coord = vec2<i32>(vec2<u32>(px) & vec2<u32>(63u));
-    let bn = textureLoad(blue_noise_tex, bn_coord, 0).r;
-    let u = (f32(bn) + 0.5) / 256.0;
-    let cdf_threshold = u * total_alpha;
-
-    var acc: f32 = 0.0;
-    var sel: u32 = count - 1u;
-    for (var i: u32 = 0u; i < count; i = i + 1u) {
-        acc = acc + layers_w[i];
-        if (cdf_threshold <= acc) {
-            sel = i;
-            break;
-        }
-    }
-
-    out.color = vec4<f32>(layers_rgb[sel] * final_alpha, final_alpha);
-    out.depth = layers_z[sel];
+    out.color = vec4<f32>(accum_rgb, total_alpha);
+    out.depth = first_z;
     return out;
 }
 "#;
@@ -296,6 +341,43 @@ impl PreviewVertex3D {
     pub const fn new(position: [f32; 3], color: [f32; 4]) -> Self {
         Self { position, color }
     }
+}
+
+/// Position-only vertex format for Pass A0 scene opaque occluder depth pre-pass.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct OccluderVertex3D {
+    pub position: [f32; 3],
+}
+
+/// Per-instance transform and section-plane clip slice for Pass A0 scene occluders.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct OccluderInstance {
+    pub model_cols: [[f32; 4]; 4],
+    pub clip_range: [u32; 2], // [offset, count] into SceneOccluderBatch.clip_planes
+}
+
+/// Indexed instanced draw group referencing a slice of [`SceneOccluderBatch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OccluderDrawGroup {
+    pub index_start: u32,
+    pub index_count: u32,
+    pub base_vertex: i32,
+    pub instance_start: u32,
+    pub instance_count: u32,
+}
+
+/// Cached opaque scene occluder batch rendered in Pass A0 into `scratch.opaque_depth_view`.
+#[derive(Clone, Copy, Debug)]
+pub struct SceneOccluderBatch<'a> {
+    pub revision: u64,
+    pub vertices: &'a [OccluderVertex3D],
+    pub indices: &'a [u32],
+    pub instances: &'a [OccluderInstance],
+    pub draw_groups: &'a [OccluderDrawGroup],
+    /// Up to 256 world-space section clip planes [a, b, c, d] where a*x+b*y+c*z+d < 0 is discarded.
+    pub clip_planes: &'a [[f32; 4]],
 }
 
 #[repr(C)]
@@ -389,20 +471,76 @@ struct DepthPeelScratch {
     resolve_bind_group: wgpu::BindGroup,
 }
 
+struct OccluderGpuCache {
+    vertex_buffer: DynamicGpuBuffer,
+    index_buffer: DynamicGpuBuffer,
+    instance_buffer: DynamicGpuBuffer,
+    clip_planes_buffer: wgpu::Buffer,
+    clipped_bind_group: wgpu::BindGroup,
+    cached_revision: Option<u64>,
+    upload_count: u64,
+}
+
 struct DepthPeelPipelines {
     color_format: wgpu::TextureFormat,
     depth_format: wgpu::TextureFormat,
     peel_bgl: wgpu::BindGroupLayout,
     tail_bgl: wgpu::BindGroupLayout,
     resolve_bgl: wgpu::BindGroupLayout,
+    occluder_fast_pipeline: wgpu::RenderPipeline,
+    occluder_clipped_pipeline: wgpu::RenderPipeline,
+    occluder_cache: OccluderGpuCache,
     peel_pipeline: wgpu::RenderPipeline,
     tail_pipeline: wgpu::RenderPipeline,
     resolve_pipeline: wgpu::RenderPipeline,
     peel_pass_uniforms: [wgpu::Buffer; PEEL_LAYER_COUNT],
-    blue_noise_texture: wgpu::Texture,
-    blue_noise_view: wgpu::TextureView,
-    blue_noise_uploaded: bool,
     scratch: Option<DepthPeelScratch>,
+}
+
+fn occluder_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<OccluderVertex3D>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: 0,
+            shader_location: 0,
+        }],
+    }
+}
+
+fn occluder_instance_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<OccluderInstance>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 0,
+                shader_location: 1,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 16,
+                shader_location: 2,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 32,
+                shader_location: 3,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 48,
+                shader_location: 4,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Uint32x2,
+                offset: 64,
+                shader_location: 5,
+            },
+        ],
+    }
 }
 
 fn preview_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
@@ -450,19 +588,6 @@ fn float_tex_bgl_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn uint_tex_bgl_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
-        ty: wgpu::BindingType::Texture {
-            sample_type: wgpu::TextureSampleType::Uint,
-            view_dimension: wgpu::TextureViewDimension::D2,
-            multisampled: false,
-        },
-        count: None,
-    }
-}
-
 fn create_2d_scratch_texture(
     device: &wgpu::Device,
     label: &str,
@@ -492,14 +617,171 @@ impl DepthPeelPipelines {
     fn new(
         device: &wgpu::Device,
         camera_bgl: &wgpu::BindGroupLayout,
+        camera_buffer: &wgpu::Buffer,
         preview_shader: &wgpu::ShaderModule,
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
     ) -> Self {
+        let occluder_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("tricore_preview3d_occluder_shader"),
+            source: wgpu::ShaderSource::Wgsl(OCCLUDER_WGSL.into()),
+        });
         let resolve_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tricore_preview3d_peel_resolve_shader"),
             source: wgpu::ShaderSource::Wgsl(RESOLVE_WGSL.into()),
         });
+
+        let occluder_clipped_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("tricore_preview3d_occluder_clipped_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let occluder_fast_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("tricore_preview3d_occluder_fast_layout"),
+            bind_group_layouts: &[Some(camera_bgl)],
+            immediate_size: 0,
+        });
+        let occluder_clipped_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("tricore_preview3d_occluder_clipped_layout"),
+                bind_group_layouts: &[Some(&occluder_clipped_bgl)],
+                immediate_size: 0,
+            });
+
+        let occluder_depth_stencil = wgpu::DepthStencilState {
+            format: depth_format,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState {
+                constant: 4,
+                slope_scale: 1.5,
+                clamp: 5e-5,
+            },
+        };
+        let occluder_primitive = wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        };
+
+        let occluder_fast_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("tricore_preview3d_occluder_fast"),
+                layout: Some(&occluder_fast_layout),
+                vertex: wgpu::VertexState {
+                    module: &occluder_shader,
+                    entry_point: Some("vs_occluder_fast"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[
+                        Some(occluder_vertex_layout()),
+                        Some(occluder_instance_layout()),
+                    ],
+                },
+                primitive: occluder_primitive,
+                depth_stencil: Some(occluder_depth_stencil.clone()),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: None,
+                multiview_mask: None,
+                cache: None,
+            });
+
+        let occluder_clipped_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("tricore_preview3d_occluder_clipped"),
+                layout: Some(&occluder_clipped_layout),
+                vertex: wgpu::VertexState {
+                    module: &occluder_shader,
+                    entry_point: Some("vs_occluder_clipped"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[
+                        Some(occluder_vertex_layout()),
+                        Some(occluder_instance_layout()),
+                    ],
+                },
+                primitive: occluder_primitive,
+                depth_stencil: Some(occluder_depth_stencil),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &occluder_shader,
+                    entry_point: Some("fs_occluder"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        let clip_planes_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tricore_preview3d_occluder_clip_planes"),
+            size: (std::mem::size_of::<[f32; 4]>() * MAX_OCCLUDER_CLIP_PLANES) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let clipped_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tricore_preview3d_occluder_clipped_bg"),
+            layout: &occluder_clipped_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: clip_planes_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let occluder_cache = OccluderGpuCache {
+            vertex_buffer: DynamicGpuBuffer::new(
+                device,
+                1024,
+                wgpu::BufferUsages::VERTEX,
+                "tricore_preview3d_occluder_vertices",
+            ),
+            index_buffer: DynamicGpuBuffer::new(
+                device,
+                1024,
+                wgpu::BufferUsages::INDEX,
+                "tricore_preview3d_occluder_indices",
+            ),
+            instance_buffer: DynamicGpuBuffer::new(
+                device,
+                1024,
+                wgpu::BufferUsages::VERTEX,
+                "tricore_preview3d_occluder_instances",
+            ),
+            clip_planes_buffer,
+            clipped_bind_group,
+            cached_revision: None,
+            upload_count: 0,
+        };
 
         let peel_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tricore_preview3d_peel_bgl"),
@@ -539,7 +821,6 @@ impl DepthPeelPipelines {
                 depth_tex_bgl_entry(9),
                 float_tex_bgl_entry(10),
                 float_tex_bgl_entry(11),
-                uint_tex_bgl_entry(12),
             ],
         });
 
@@ -716,64 +997,53 @@ impl DepthPeelPipelines {
             buf
         });
 
-        let blue_noise_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("tricore_preview3d_blue_noise_64x64"),
-            size: wgpu::Extent3d {
-                width: BLUE_NOISE_DIM,
-                height: BLUE_NOISE_DIM,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Uint,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let blue_noise_view =
-            blue_noise_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
         Self {
             color_format,
             depth_format,
             peel_bgl,
             tail_bgl,
             resolve_bgl,
+            occluder_fast_pipeline,
+            occluder_clipped_pipeline,
+            occluder_cache,
             peel_pipeline,
             tail_pipeline,
             resolve_pipeline,
             peel_pass_uniforms,
-            blue_noise_texture,
-            blue_noise_view,
-            blue_noise_uploaded: false,
             scratch: None,
         }
     }
 
-    fn ensure_blue_noise_uploaded(&mut self, queue: &wgpu::Queue) {
-        if self.blue_noise_uploaded {
+    fn sync_occluder_buffers(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch: &SceneOccluderBatch<'_>,
+    ) {
+        if self.occluder_cache.cached_revision == Some(batch.revision) {
             return;
         }
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.blue_noise_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &BLUE_NOISE_64X64,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(BLUE_NOISE_DIM),
-                rows_per_image: Some(BLUE_NOISE_DIM),
-            },
-            wgpu::Extent3d {
-                width: BLUE_NOISE_DIM,
-                height: BLUE_NOISE_DIM,
-                depth_or_array_layers: 1,
-            },
+        self.occluder_cache
+            .vertex_buffer
+            .write_pod(device, queue, batch.vertices);
+        self.occluder_cache
+            .index_buffer
+            .write_pod(device, queue, batch.indices);
+        self.occluder_cache
+            .instance_buffer
+            .write_pod(device, queue, batch.instances);
+        let mut planes = [[0.0_f32; 4]; MAX_OCCLUDER_CLIP_PLANES];
+        let count = batch.clip_planes.len().min(MAX_OCCLUDER_CLIP_PLANES);
+        if count > 0 {
+            planes[..count].copy_from_slice(&batch.clip_planes[..count]);
+        }
+        queue.write_buffer(
+            &self.occluder_cache.clip_planes_buffer,
+            0,
+            bytemuck::cast_slice(&planes),
         );
-        self.blue_noise_uploaded = true;
+        self.occluder_cache.cached_revision = Some(batch.revision);
+        self.occluder_cache.upload_count += 1;
     }
 
     fn ensure_scratch(&mut self, device: &wgpu::Device, width: u32, height: u32) -> &DepthPeelScratch {
@@ -934,10 +1204,6 @@ impl DepthPeelPipelines {
                     wgpu::BindGroupEntry {
                         binding: 11,
                         resource: wgpu::BindingResource::TextureView(&tail_meta_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 12,
-                        resource: wgpu::BindingResource::TextureView(&self.blue_noise_view),
                     },
                 ],
             });
@@ -1295,7 +1561,14 @@ impl Preview3dPipeline {
         );
 
         let depth_peel = depth_format.map(|df| {
-            DepthPeelPipelines::new(device, &bind_group_layout, &shader, color_format, df)
+            DepthPeelPipelines::new(
+                device,
+                &bind_group_layout,
+                &camera_buffer,
+                &shader,
+                color_format,
+                df,
+            )
         });
 
         Self {
@@ -1520,13 +1793,23 @@ impl Preview3dPipeline {
         }
     }
 
-    /// Prepares geometry and records a depth-tested 3D pass.
+    /// Returns the total number of Pass A0 scene occluder GPU buffer uploads performed.
+    pub fn occluder_upload_count(&self) -> u64 {
+        self.depth_peel
+            .as_ref()
+            .map_or(0, |peel| peel.occluder_cache.upload_count)
+    }
+
+    /// Invalidates the cached Pass A0 scene occluder GPU revision so the next batch re-uploads.
+    pub fn clear_occluder_cache(&mut self) {
+        if let Some(ref mut peel) = self.depth_peel {
+            peel.occluder_cache.cached_revision = None;
+        }
+    }
+
+    /// Prepares geometry and records a depth-tested 3D pass without Pass A0 scene occluders.
     ///
-    /// When `data.has_translucent()` is `false`, executes the zero-translucent fast-path directly
-    /// into `color_view` / `depth_view` without allocating depth-peeling scratch textures.
-    /// When translucent triangles are present and `depth_view` is `Some`, executes the D-P64-10
-    /// 6-subpass front-to-back depth peeling (`K = 4`) + `Rgba16Float` 2-MRT tail + static 64x64
-    /// Void-and-Cluster blue-noise importance-sampled single-depth resolve into `color_view` / `depth_view`.
+    /// Forwards to [`Self::render_depth_tested_with_occluders`] with `occluders: None`.
     #[allow(clippy::too_many_arguments)]
     pub fn render_depth_tested(
         &mut self,
@@ -1540,6 +1823,44 @@ impl Preview3dPipeline {
         clear_depth: Option<f32>,
         view_proj: Mat4,
         data: &Preview3dPassData<'_>,
+    ) {
+        self.render_depth_tested_with_occluders(
+            device,
+            queue,
+            encoder,
+            color_view,
+            depth_view,
+            target_size,
+            clear_color,
+            clear_depth,
+            view_proj,
+            data,
+            None,
+        );
+    }
+
+    /// Prepares geometry and records a depth-tested 3D pass with optional Pass A0 scene occluders.
+    ///
+    /// When `data.has_translucent()` is `false`, executes the zero-translucent fast-path directly
+    /// into `color_view` / `depth_view` without running Pass A0 or allocating depth-peeling scratch textures.
+    /// When translucent triangles are present and `depth_view` is `Some`, executes optional Pass A0
+    /// scene opaque depth pre-pass into `scratch.opaque_depth_view`, followed by Sub-pass 0 (overlay
+    /// opaque + lines/strips/points), integer-ULP-guarded front-to-back depth peeling (`K = 4`),
+    /// `Rgba16Float` 2-MRT tail, and deterministic smooth Porter-Duff Over resolve into `color_view` / `depth_view`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_depth_tested_with_occluders(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        color_view: &wgpu::TextureView,
+        depth_view: Option<&wgpu::TextureView>,
+        target_size: [u32; 2],
+        clear_color: Option<wgpu::Color>,
+        clear_depth: Option<f32>,
+        view_proj: Mat4,
+        data: &Preview3dPassData<'_>,
+        occluders: Option<&SceneOccluderBatch<'_>>,
     ) {
         if !data.has_translucent() || depth_view.is_none() || self.depth_peel.is_none() {
             self.render_with_mode(
@@ -1566,24 +1887,85 @@ impl Preview3dPipeline {
             compute_translucent_scissor_rect(data.translucent_triangles, view_proj, phys_w, phys_h);
         let has_scissor_area = scissor[2] > 0 && scissor[3] > 0;
 
+        let active_occluders = occluders.filter(|batch| {
+            !batch.draw_groups.is_empty()
+                && !batch.vertices.is_empty()
+                && !batch.indices.is_empty()
+                && !batch.instances.is_empty()
+        });
+
         let peel = self.depth_peel.as_mut().expect("checked Some above");
-        peel.ensure_blue_noise_uploaded(queue);
+        if let Some(batch) = active_occluders {
+            peel.sync_occluder_buffers(device, queue, batch);
+        }
         let _ = peel.ensure_scratch(device, phys_w, phys_h);
 
         let peel = self.depth_peel.as_ref().expect("checked Some above");
         let scratch = peel.scratch.as_ref().expect("scratch allocated");
 
         let has_indices = !self.staged_indices.is_empty();
+        let mut ran_pass_a0 = false;
+
+        // Pass A0: Optional depth-only scene occluder pre-pass directly into scratch.opaque_depth_view.
+        if let Some(batch) = active_occluders {
+            ran_pass_a0 = true;
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("tricore_preview3d_pass_a0_occluders"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &scratch.opaque_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if has_scissor_area {
+                pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
+                if batch.clip_planes.is_empty() {
+                    pass.set_pipeline(&peel.occluder_fast_pipeline);
+                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                } else {
+                    pass.set_pipeline(&peel.occluder_clipped_pipeline);
+                    pass.set_bind_group(0, &peel.occluder_cache.clipped_bind_group, &[]);
+                }
+                pass.set_vertex_buffer(0, peel.occluder_cache.vertex_buffer.buffer.slice(..));
+                pass.set_vertex_buffer(1, peel.occluder_cache.instance_buffer.buffer.slice(..));
+                pass.set_index_buffer(
+                    peel.occluder_cache.index_buffer.buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                for g in batch.draw_groups {
+                    if g.index_count == 0 || g.instance_count == 0 {
+                        continue;
+                    }
+                    pass.draw_indexed(
+                        g.index_start..g.index_start + g.index_count,
+                        g.base_vertex,
+                        g.instance_start..g.instance_start + g.instance_count,
+                    );
+                }
+            }
+        }
 
         // Sub-pass 0: Opaque triangles + lines + line strips + points -> opaque_target.
         {
+            let opaque_depth_load = if ran_pass_a0 {
+                wgpu::LoadOp::Load
+            } else {
+                wgpu::LoadOp::Clear(clear_depth.unwrap_or(1.0))
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("tricore_preview3d_peel_opaque"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &scratch.opaque_color_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color.unwrap_or(wgpu::Color::TRANSPARENT)),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -1591,7 +1973,7 @@ impl Preview3dPipeline {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &scratch.opaque_depth_view,
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_depth.unwrap_or(1.0)),
+                        load: opaque_depth_load,
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,

@@ -1,7 +1,6 @@
 //! Pure-WGPU render pipelines with zero external UI or gizmo dependencies.
 
 pub mod alpha_blit;
-pub mod blue_noise;
 pub mod composite_finalize;
 pub mod gizmo2d;
 pub mod preview3d;
